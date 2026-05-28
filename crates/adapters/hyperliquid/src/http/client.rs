@@ -2767,6 +2767,19 @@ impl HyperliquidHttpClient {
                     HyperliquidExecOrderStatus::Error { error } => {
                         Err(Error::bad_request(format!("Order rejected: {error}")))
                     }
+                    HyperliquidExecOrderStatus::Tag(tag) => {
+                        // Bare-string status with no oid — `"waitingForFill"`
+                        // (normalTpsl child) or `"waitingForTrigger"`
+                        // (standalone trigger). The single-order submit path
+                        // shouldn't see these in practice (Tag is only
+                        // returned for grouped bracket children), but if it
+                        // happens, return a deferred error so the caller can
+                        // wait for the WS activation event rather than
+                        // proceeding with a half-initialized report.
+                        Err(Error::bad_request(format!(
+                            "Order status deferred: {tag:?} — expect WebSocket userEvents update"
+                        )))
+                    }
                 }
             }
             HyperliquidExchangeResponse::Error { error } => Err(Error::bad_request(format!(
@@ -2935,6 +2948,16 @@ impl HyperliquidHttpClient {
                 // status. For grouped submissions the exchange may return
                 // fewer statuses; remaining orders are confirmed via WS.
                 for (order, order_status) in orders.iter().zip(order_response.statuses.iter()) {
+                    // Trigger children in a `normalTpsl` (or standalone
+                    // trigger orders) come back as bare-string tags rather
+                    // than `{resting: ...}` objects — the venue defers oid
+                    // assignment until activation. Skip emitting a
+                    // synchronous report and rely on the WebSocket
+                    // `userEvents` stream to deliver the activation event.
+                    if matches!(order_status, HyperliquidExecOrderStatus::Tag(_)) {
+                        continue;
+                    }
+
                     // Extract asset from instrument symbol
                     let instrument_id = order.instrument_id();
                     let symbol = instrument_id.symbol.as_str();
@@ -2950,6 +2973,9 @@ impl HyperliquidHttpClient {
 
                     // Create OrderStatusReport based on the order status
                     let report = match order_status {
+                        HyperliquidExecOrderStatus::Tag(_) => unreachable!(
+                            "Tag variants are skipped above"
+                        ),
                         HyperliquidExecOrderStatus::Resting { resting } => {
                             // Order is resting on the order book
                             self.create_order_status_report(

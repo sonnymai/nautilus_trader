@@ -1530,6 +1530,21 @@ pub struct HyperliquidExecModifyResponseData {
     pub statuses: Vec<HyperliquidExecModifyStatus>,
 }
 
+/// Status tags Hyperliquid serializes as a bare JSON string instead of an
+/// object — observed empirically for trigger children of a `normalTpsl`
+/// group and for standalone trigger orders that haven't armed yet. The
+/// venue assigns these orders an `oid` only when they activate, after which
+/// NT's WebSocket `userEvents` stream delivers the real status update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HyperliquidExecOrderStatusTag {
+    /// Child of a `normalTpsl` bracket — parked until the parent entry fills.
+    #[serde(rename = "waitingForFill")]
+    WaitingForFill,
+    /// Standalone trigger order — parked until its trigger price is touched.
+    #[serde(rename = "waitingForTrigger")]
+    WaitingForTrigger,
+}
+
 /// Status of an individual order submission via exchange endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1549,6 +1564,12 @@ pub enum HyperliquidExecOrderStatus {
         /// Error message.
         error: String,
     },
+    /// Bare-string status tag — `"waitingForFill"` or `"waitingForTrigger"`.
+    /// Returned for trigger children of a grouped bracket; the venue defers
+    /// oid assignment until activation, so callers should skip emitting a
+    /// synchronous `OrderStatusReport` and rely on WebSocket `userEvents`
+    /// for the activation event.
+    Tag(HyperliquidExecOrderStatusTag),
 }
 
 /// Information about a resting order via exchange endpoint.
