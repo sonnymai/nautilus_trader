@@ -2948,16 +2948,6 @@ impl HyperliquidHttpClient {
                 // status. For grouped submissions the exchange may return
                 // fewer statuses; remaining orders are confirmed via WS.
                 for (order, order_status) in orders.iter().zip(order_response.statuses.iter()) {
-                    // Trigger children in a `normalTpsl` (or standalone
-                    // trigger orders) come back as bare-string tags rather
-                    // than `{resting: ...}` objects — the venue defers oid
-                    // assignment until activation. Skip emitting a
-                    // synchronous report and rely on the WebSocket
-                    // `userEvents` stream to deliver the activation event.
-                    if matches!(order_status, HyperliquidExecOrderStatus::Tag(_)) {
-                        continue;
-                    }
-
                     // Extract asset from instrument symbol
                     let instrument_id = order.instrument_id();
                     let symbol = instrument_id.symbol.as_str();
@@ -2973,9 +2963,34 @@ impl HyperliquidHttpClient {
 
                     // Create OrderStatusReport based on the order status
                     let report = match order_status {
-                        HyperliquidExecOrderStatus::Tag(_) => unreachable!(
-                            "Tag variants are skipped above"
-                        ),
+                        HyperliquidExecOrderStatus::Tag(_) => {
+                            // Trigger child of a `normalTpsl` bracket: HL
+                            // accepted it atomically but has not assigned an
+                            // oid yet. Use a `pending-cloid:` placeholder —
+                            // the real oid arrives via the user-events WS
+                            // stream and is reconciled via the cloid mapping
+                            // cached in the ws_client at submit time.
+                            let placeholder = VenueOrderId::new(format!(
+                                "pending-cloid:{}",
+                                order.client_order_id().as_str(),
+                            ));
+                            self.create_order_status_report(
+                                order.instrument_id(),
+                                Some(order.client_order_id()),
+                                placeholder,
+                                order.order_side(),
+                                order.order_type(),
+                                order.quantity(),
+                                order.time_in_force(),
+                                order.price(),
+                                order.trigger_price(),
+                                OrderStatus::Accepted,
+                                Quantity::new(0.0, instrument.size_precision()),
+                                &instrument,
+                                account_id,
+                                ts_init,
+                            )
+                        }
                         HyperliquidExecOrderStatus::Resting { resting } => {
                             // Order is resting on the order book
                             self.create_order_status_report(

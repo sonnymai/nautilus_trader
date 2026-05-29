@@ -744,7 +744,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
 
         try:
             pyo3_orders = [transform_order_to_pyo3(order) for order in orders]
-            await self._client.submit_orders(pyo3_orders)
+            pyo3_reports = await self._client.submit_orders(pyo3_orders)
         except Exception as e:
             if _is_transport_error(e):
                 self._log.warning(
@@ -766,6 +766,27 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     reason=error_str,
                     ts_event=self._clock.timestamp_ns(),
                     due_post_only=due_post_only,
+                )
+            return
+
+        # Process the synchronous submit response so each order transitions
+        # SUBMITTED → ACCEPTED|FILLED|REJECTED without waiting on the
+        # WebSocket `userEvents` stream. Necessary for atomic `normalTpsl`
+        # brackets: HL returns the parent's oid synchronously but parks the
+        # SL/TP children as bare-string `"waitingForFill"` statuses with no
+        # oid until activation. Our patched HTTP/WS client emits a synthetic
+        # Accepted report with a `pending-cloid:...` placeholder
+        # venue_order_id for each Tag-status child so NT's inflight tracker
+        # can transition them out of SUBMITTED. The real oid arrives later
+        # via the WS stream and updates the order via the existing cloid
+        # mapping cached in the ws client above.
+        for pyo3_report in pyo3_reports or ():
+            try:
+                self._handle_order_status_report_pyo3(pyo3_report)
+            except Exception as e:
+                self._log.warning(
+                    f"Failed to process submit response report "
+                    f"({type(e).__name__}: {e}); awaiting WS reconciliation",
                 )
 
     async def _modify_order(self, command: ModifyOrder) -> None:  # noqa: C901 (sequence of guard clauses)
