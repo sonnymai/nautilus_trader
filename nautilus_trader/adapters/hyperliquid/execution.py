@@ -672,7 +672,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
             self._ws_client.cache_cloid_mapping(cloid, pyo3_client_order_id)
 
-            await self._client.submit_order(
+            pyo3_report = await self._client.submit_order(
                 instrument_id=pyo3_instrument_id,
                 client_order_id=pyo3_client_order_id,
                 order_side=pyo3_order_side,
@@ -705,6 +705,27 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
                 due_post_only=due_post_only,
             )
+            return
+
+        # Process the synchronous submit response so the order transitions
+        # SUBMITTED → ACCEPTED|FILLED without waiting on the WebSocket
+        # `userEvents` stream. Critical for MARKET orders, which HL
+        # synthesizes as IOC LIMIT and frequently fills at submit time —
+        # without this consumption, the order's terminal `Filled` state never
+        # propagates from the synchronous response, NT's inflight tracker
+        # queries via HTTP and finds nothing (HL closed the order on fill),
+        # times out after 5 retries, and emits a spurious OrderRejected
+        # while the position sits open on HL with no NT-side tracking.
+        # `_handle_order_status_report_pyo3` is shared with the WS path and
+        # internally resolves the cloid + emits the appropriate event.
+        if pyo3_report is not None:
+            try:
+                self._handle_order_status_report_pyo3(pyo3_report)
+            except Exception as e:
+                self._log.warning(
+                    f"Failed to process submit response report "
+                    f"({type(e).__name__}: {e}); awaiting WS reconciliation",
+                )
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         order_list = command.order_list
