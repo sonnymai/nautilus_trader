@@ -331,6 +331,25 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 )
                 return None
 
+            # hyperpoo.hl4: pending-cloid placeholders are not real HL oids,
+            # they're a fork-local synthetic ID emitted by `_handle_pyo3_*`
+            # for Tag-status bracket children (see commit hl2). The Rust
+            # client parses venue_order_id as u64 (HL oid) and raises
+            # `ValueError("invalid digit found in string")` on the placeholder
+            # prefix. Null it out so the lookup falls through to the cloid
+            # path; if there's no client_order_id either, return None
+            # gracefully — the WS `userEvents` stream resolves the real oid
+            # asynchronously and any reconciliation will succeed once it
+            # arrives.
+            if venue_order_id and venue_order_id.startswith("pending-cloid:"):
+                self._log.debug(
+                    f"Skipping pending-cloid placeholder in status lookup: "
+                    f"{venue_order_id}; using client_order_id={client_order_id}",
+                )
+                venue_order_id = None
+                if client_order_id is None:
+                    return None
+
             pyo3_report = await self._client.request_order_status_report(
                 venue_order_id=venue_order_id,
                 client_order_id=client_order_id,
@@ -946,6 +965,14 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         elif command.venue_order_id:
             venue_order_id = command.venue_order_id
 
+        # hyperpoo.hl4: see generate_order_status_report — placeholder
+        # venue_order_ids can't reach the venue. The Rust client already
+        # prefers client_order_id (CancelByCloid) over venue_order_id, but
+        # null the placeholder defensively so anyone reading the request
+        # log sees the explicit intent.
+        if venue_order_id and venue_order_id.value.startswith("pending-cloid:"):
+            venue_order_id = None
+
         try:
             pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
                 command.instrument_id.value,
@@ -1004,9 +1031,12 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                     order.instrument_id.value,
                 )
                 pyo3_client_order_id = nautilus_pyo3.ClientOrderId(order.client_order_id.value)
+                # hyperpoo.hl4: defensive null-out of placeholder venue_order_id
+                # (see _cancel_order). Rust prefers cloid anyway, but explicit.
                 pyo3_venue_order_id = (
                     nautilus_pyo3.VenueOrderId(order.venue_order_id.value)
                     if order.venue_order_id
+                    and not order.venue_order_id.value.startswith("pending-cloid:")
                     else None
                 )
 
