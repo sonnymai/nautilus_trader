@@ -190,6 +190,8 @@ async fn close_position(
             position_idx,
             None,
             None,
+            // hyperpoo.bb1: flatten path doesn't use native TP/SL.
+            None, None, None, None, None, None, None, None, None,
         )
         .await?;
 

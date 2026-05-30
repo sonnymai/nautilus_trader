@@ -1215,6 +1215,10 @@ impl ExecutionClient for BybitExecutionClient {
                         position_idx,
                         bbo_side_type,
                         bbo_level,
+                        // hyperpoo.bb1: Rust execution path doesn't surface
+                        // TP/SL params yet; preserve existing behavior by
+                        // passing None. Python path threads them through.
+                        None, None, None, None, None, None, None, None, None,
                     )
                     .await;
 
@@ -1470,6 +1474,8 @@ impl ExecutionClient for BybitExecutionClient {
                             position_idx,
                             bbo_side_type,
                             bbo_level.clone(),
+                            // hyperpoo.bb1: see single-path note above.
+                            None, None, None, None, None, None, None, None, None,
                         )
                         .await
                     {

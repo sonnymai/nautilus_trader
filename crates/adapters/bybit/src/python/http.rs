@@ -39,8 +39,8 @@ use ustr::Ustr;
 use crate::{
     common::{
         enums::{
-            BybitMarginMode, BybitOpenOnly, BybitOrderFilter, BybitPositionIdx, BybitPositionMode,
-            BybitProductType,
+            BybitMarginMode, BybitOpenOnly, BybitOrderFilter, BybitOrderType, BybitPositionIdx,
+            BybitPositionMode, BybitProductType, BybitTpSlMode, BybitTriggerType,
         },
         parse::{extract_raw_symbol, parse_bbo_level, parse_bbo_side_type},
     },
@@ -576,6 +576,16 @@ impl BybitHttpClient {
         position_idx = None,
         bbo_side_type = None,
         bbo_level = None,
+        // hyperpoo.bb1: native TP/SL params for demo HTTP path.
+        take_profit = None,
+        stop_loss = None,
+        tp_trigger_by = None,
+        sl_trigger_by = None,
+        tp_order_type = None,
+        sl_order_type = None,
+        tp_limit_price = None,
+        sl_limit_price = None,
+        tpsl_mode = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -598,6 +608,15 @@ impl BybitHttpClient {
         position_idx: Option<BybitPositionIdx>,
         bbo_side_type: Option<String>,
         bbo_level: Option<String>,
+        take_profit: Option<Price>,
+        stop_loss: Option<Price>,
+        tp_trigger_by: Option<String>,
+        sl_trigger_by: Option<String>,
+        tp_order_type: Option<String>,
+        sl_order_type: Option<String>,
+        tp_limit_price: Option<Price>,
+        sl_limit_price: Option<Price>,
+        tpsl_mode: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let bbo_side_type = bbo_side_type
@@ -613,6 +632,29 @@ impl BybitHttpClient {
                 "'bbo_side_type' and 'bbo_level' must be provided together"
             )));
         }
+        // hyperpoo.bb1: parse string→enum via serde so the Python caller can
+        // pass Bybit's wire-format strings ("Limit", "MarkPrice", "Full", ...)
+        // without importing the pyo3 enum classes.
+        let tp_trigger_by = tp_trigger_by
+            .map(|v| serde_json::from_value::<BybitTriggerType>(serde_json::Value::String(v)))
+            .transpose()
+            .map_err(|e| to_pyvalue_err(anyhow::anyhow!("invalid tp_trigger_by: {e}")))?;
+        let sl_trigger_by = sl_trigger_by
+            .map(|v| serde_json::from_value::<BybitTriggerType>(serde_json::Value::String(v)))
+            .transpose()
+            .map_err(|e| to_pyvalue_err(anyhow::anyhow!("invalid sl_trigger_by: {e}")))?;
+        let tp_order_type = tp_order_type
+            .map(|v| serde_json::from_value::<BybitOrderType>(serde_json::Value::String(v)))
+            .transpose()
+            .map_err(|e| to_pyvalue_err(anyhow::anyhow!("invalid tp_order_type: {e}")))?;
+        let sl_order_type = sl_order_type
+            .map(|v| serde_json::from_value::<BybitOrderType>(serde_json::Value::String(v)))
+            .transpose()
+            .map_err(|e| to_pyvalue_err(anyhow::anyhow!("invalid sl_order_type: {e}")))?;
+        let tpsl_mode = tpsl_mode
+            .map(|v| serde_json::from_value::<BybitTpSlMode>(serde_json::Value::String(v)))
+            .transpose()
+            .map_err(|e| to_pyvalue_err(anyhow::anyhow!("invalid tpsl_mode: {e}")))?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = client
@@ -634,6 +676,15 @@ impl BybitHttpClient {
                     position_idx,
                     bbo_side_type,
                     bbo_level,
+                    take_profit,
+                    stop_loss,
+                    tp_trigger_by,
+                    sl_trigger_by,
+                    tp_order_type,
+                    sl_order_type,
+                    tp_limit_price,
+                    sl_limit_price,
+                    tpsl_mode,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;

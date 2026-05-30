@@ -92,7 +92,7 @@ use crate::common::{
     enums::{
         BybitAccountType, BybitBboSideType, BybitContractType, BybitEnvironment, BybitMarginMode,
         BybitOpenOnly, BybitOrderFilter, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-        BybitPositionMode, BybitProductType,
+        BybitPositionMode, BybitProductType, BybitTpSlMode, BybitTriggerType,
     },
     models::{BybitCursorListResponse, BybitErrorCheck, BybitResponseCheck},
     parse::{
@@ -2424,6 +2424,18 @@ impl BybitHttpClient {
         position_idx: Option<BybitPositionIdx>,
         bbo_side_type: Option<BybitBboSideType>,
         bbo_level: Option<String>,
+        // hyperpoo.bb1: native TP/SL params for demo HTTP path. The wire
+        // payload (BybitBatchPlaceOrderEntry) already supports these fields;
+        // they just weren't wired into the single-order HTTP signature.
+        take_profit: Option<Price>,
+        stop_loss: Option<Price>,
+        tp_trigger_by: Option<BybitTriggerType>,
+        sl_trigger_by: Option<BybitTriggerType>,
+        tp_order_type: Option<BybitOrderType>,
+        sl_order_type: Option<BybitOrderType>,
+        tp_limit_price: Option<Price>,
+        sl_limit_price: Option<Price>,
+        tpsl_mode: Option<BybitTpSlMode>,
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
@@ -2480,6 +2492,35 @@ impl BybitHttpClient {
 
         order_entry.bbo_side_type(bbo_side_type);
         order_entry.bbo_level(bbo_level);
+
+        // hyperpoo.bb1: thread native TP/SL into the wire entry.
+        if let Some(tp) = take_profit {
+            order_entry.take_profit(Some(tp.to_string()));
+        }
+        if let Some(sl) = stop_loss {
+            order_entry.stop_loss(Some(sl.to_string()));
+        }
+        if let Some(tp_trig) = tp_trigger_by {
+            order_entry.tp_trigger_by(Some(tp_trig));
+        }
+        if let Some(sl_trig) = sl_trigger_by {
+            order_entry.sl_trigger_by(Some(sl_trig));
+        }
+        if let Some(tp_ot) = tp_order_type {
+            order_entry.tp_order_type(Some(tp_ot));
+        }
+        if let Some(sl_ot) = sl_order_type {
+            order_entry.sl_order_type(Some(sl_ot));
+        }
+        if let Some(tp_lp) = tp_limit_price {
+            order_entry.tp_limit_price(Some(tp_lp.to_string()));
+        }
+        if let Some(sl_lp) = sl_limit_price {
+            order_entry.sl_limit_price(Some(sl_lp.to_string()));
+        }
+        if let Some(mode) = tpsl_mode {
+            order_entry.tpsl_mode(Some(mode));
+        }
 
         let order_entry = order_entry.build().build_anyhow()?;
 

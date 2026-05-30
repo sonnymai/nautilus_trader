@@ -938,17 +938,18 @@ class BybitExecutionClient(LiveExecutionClient):
             )
             return
 
+        # hyperpoo.bb1: demo path now supports native TP/SL via HTTP — the wire
+        # payload (`/v5/order/create`) accepts the same `takeProfit`/`stopLoss`
+        # fields as mainnet. Only option-specific fields (`order_iv`/`mmp`)
+        # remain unsupported on demo.
         if self._is_demo and (
-            tp_sl.get("take_profit")
-            or tp_sl.get("stop_loss")
-            or tp_sl.get("order_iv") is not None
-            or tp_sl.get("mmp") is not None
+            tp_sl.get("order_iv") is not None or tp_sl.get("mmp") is not None
         ):
             self.generate_order_denied(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason="Native TP/SL and option params are not supported in demo mode",
+                reason="Option params (order_iv/mmp) are not supported in demo mode",
                 ts_event=self._clock.timestamp_ns(),
             )
             return
@@ -1014,6 +1015,16 @@ class BybitExecutionClient(LiveExecutionClient):
                     position_idx=position_idx,
                     bbo_side_type=tp_sl.get("bbo_side_type"),
                     bbo_level=tp_sl.get("bbo_level"),
+                    # hyperpoo.bb1: pass native TP/SL through to demo HTTP.
+                    take_profit=_price_or_none(tp_sl.get("take_profit")),
+                    stop_loss=_price_or_none(tp_sl.get("stop_loss")),
+                    tp_trigger_by=tp_sl.get("tp_trigger_by"),
+                    sl_trigger_by=tp_sl.get("sl_trigger_by"),
+                    tp_order_type=tp_sl.get("tp_order_type"),
+                    sl_order_type=tp_sl.get("sl_order_type"),
+                    tp_limit_price=_price_or_none(tp_sl.get("tp_limit_price")),
+                    sl_limit_price=_price_or_none(tp_sl.get("sl_limit_price")),
+                    tpsl_mode=tp_sl.get("tpsl_mode"),
                 )
             elif (
                 tp_sl.get("take_profit")
@@ -1124,19 +1135,16 @@ class BybitExecutionClient(LiveExecutionClient):
             return
 
         if self._is_demo:
-            if (
-                tp_sl.get("take_profit")
-                or tp_sl.get("stop_loss")
-                or tp_sl.get("order_iv") is not None
-                or tp_sl.get("mmp") is not None
-            ):
+            # hyperpoo.bb1: demo path now supports native TP/SL via HTTP. Only
+            # option-specific fields (`order_iv`/`mmp`) remain unsupported.
+            if tp_sl.get("order_iv") is not None or tp_sl.get("mmp") is not None:
                 now_ns = self._clock.timestamp_ns()
                 for order in command.order_list.orders:
                     self.generate_order_denied(
                         strategy_id=order.strategy_id,
                         instrument_id=order.instrument_id,
                         client_order_id=order.client_order_id,
-                        reason="Native TP/SL and option params are not supported in demo mode",
+                        reason="Option params (order_iv/mmp) are not supported in demo mode",
                         ts_event=now_ns,
                     )
                 return
@@ -1222,6 +1230,16 @@ class BybitExecutionClient(LiveExecutionClient):
                     position_idx=position_idx,
                     bbo_side_type=tp_sl.get("bbo_side_type"),
                     bbo_level=tp_sl.get("bbo_level"),
+                    # hyperpoo.bb1: pass native TP/SL through to demo HTTP.
+                    take_profit=_price_or_none(tp_sl.get("take_profit")),
+                    stop_loss=_price_or_none(tp_sl.get("stop_loss")),
+                    tp_trigger_by=tp_sl.get("tp_trigger_by"),
+                    sl_trigger_by=tp_sl.get("sl_trigger_by"),
+                    tp_order_type=tp_sl.get("tp_order_type"),
+                    sl_order_type=tp_sl.get("sl_order_type"),
+                    tp_limit_price=_price_or_none(tp_sl.get("tp_limit_price")),
+                    sl_limit_price=_price_or_none(tp_sl.get("sl_limit_price")),
+                    tpsl_mode=tp_sl.get("tpsl_mode"),
                 )
             except Exception as e:
                 error_msg = str(e)
@@ -2217,6 +2235,17 @@ def _validate_bybit_bbo_params(
             "UNSUPPORTED: `bbo_side_type` and `bbo_level` are not supported for "
             f"order type {order.type_string()} on Bybit",
         )
+
+
+def _price_or_none(value: object) -> object:
+    """Convert a tp_sl price-string to a pyo3 Price (or None).
+
+    hyperpoo.bb1: the demo HTTP submit_order pyo3 binding accepts native
+    TP/SL prices as ``Option<Price>``. The parser stores them as strings.
+    """
+    if value is None:
+        return None
+    return nautilus_pyo3.Price.from_str(str(value))
 
 
 def _apply_tp_sl_fields(order_params: object, tp_sl: dict) -> None:
