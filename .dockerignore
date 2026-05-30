@@ -1,3 +1,17 @@
+# hyperpoo.bb1: stop macOS build artifacts from contaminating the linux
+# build context. The original patterns below (.venv / *.so / target/) did
+# not match recursively, so .venv/lib/python3.13/site-packages/.../*.so
+# slipped through and the linux `strip` step choked on cpython-313-darwin
+# objects. Anchor + recursive variants below override that gap.
+.venv/
+.venv/**
+venv/
+venv/**
+target/
+target/**
+**/*.so
+**/*.pyd
+**/__pycache__/
 ### JetBrains template
 # Covers JetBrains IDEs: IntelliJ, RubyMine, PhpStorm, AppCode, PyCharm, CLion, Android Studio, WebStorm and Rider
 # Reference: https://intellij-support.jetbrains.com/hc/en-us/articles/206544839
