@@ -28,6 +28,14 @@ ENV CARGO_HOME=/usr/local/cargo \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --default-toolchain stable --profile minimal
 
+# uv's build isolation runs build.py in a fresh subprocess that doesn't
+# always inherit our PATH manipulation, so the build script's `rustc
+# --version` check fails. Symlink rustc/cargo into the system bin so
+# they're discoverable regardless of PATH inheritance.
+RUN ln -sf /usr/local/cargo/bin/rustc /usr/bin/rustc \
+    && ln -sf /usr/local/cargo/bin/cargo /usr/bin/cargo \
+    && rustc --version && cargo --version
+
 RUN pip install --no-cache-dir uv==0.11.12
 
 WORKDIR /src

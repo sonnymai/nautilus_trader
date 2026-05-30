@@ -2041,6 +2041,9 @@ class BybitExecutionClient(LiveExecutionClient):
 # Bybit V5 API uses PascalCase strings for these enum fields.
 _BYBIT_VALID_TRIGGER_TYPES: frozenset[str] = frozenset({"LastPrice", "IndexPrice", "MarkPrice"})
 _BYBIT_VALID_ORDER_TYPES: frozenset[str] = frozenset({"Market", "Limit"})
+# hyperpoo.bb1: see BybitTpSlMode enum in common/enums.rs — must match the
+# serde rename ("Full" / "Partial"). Empty/None lets venue use its default.
+_BYBIT_VALID_TPSL_MODES: frozenset[str] = frozenset({"Full", "Partial"})
 _BYBIT_VALID_BBO_SIDE_TYPES: frozenset[str] = frozenset({"Queue", "Counterparty"})
 _BYBIT_VALID_BBO_LEVELS: frozenset[str] = frozenset({"1", "2", "3", "4", "5"})
 _BYBIT_BBO_ORDER_TYPES: frozenset[OrderType] = frozenset(
@@ -2176,6 +2179,9 @@ def _parse_bybit_tp_sl_params(params: dict | None) -> dict:
         ("sl_trigger_by", _BYBIT_VALID_TRIGGER_TYPES, "trigger type"),
         ("tp_order_type", _BYBIT_VALID_ORDER_TYPES, "order type"),
         ("sl_order_type", _BYBIT_VALID_ORDER_TYPES, "order type"),
+        # hyperpoo.bb1: tpsl_mode is required by Bybit (error 10001)
+        # whenever tp_limit_price / sl_limit_price is set.
+        ("tpsl_mode", _BYBIT_VALID_TPSL_MODES, "TP/SL mode"),
     ):
         val = p.get(key)
         if val is not None:
