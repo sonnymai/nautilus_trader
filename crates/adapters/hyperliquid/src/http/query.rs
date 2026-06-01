@@ -281,6 +281,20 @@ impl InfoRequest {
         }
     }
 
+    /// hyperpoo.hl5: Creates a request for `historicalOrders` info type.
+    /// Returns up to 2000 most recent orders (open + filled + canceled) for a
+    /// user, with each entry carrying its status. Used as a fallback in
+    /// `request_order_status_report_by_client_order_id` when the order is no
+    /// longer in `frontend_open_orders` (e.g. already filled).
+    pub fn historical_orders(user: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::HistoricalOrders,
+            params: InfoRequestParams::OpenOrders(OpenOrdersParams {
+                user: user.to_string(),
+            }),
+        }
+    }
+
     /// Creates a request to get user state (balances, positions, margin).
     pub fn clearinghouse_state(user: &str) -> Self {
         Self {

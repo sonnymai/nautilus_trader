@@ -401,6 +401,12 @@ impl HyperliquidRawHttpClient {
         self.send_info_request(&request).await
     }
 
+    /// hyperpoo.hl5: Get historical orders for a user (open + filled + canceled).
+    pub async fn info_historical_orders(&self, user: &str) -> Result<Value> {
+        let request = InfoRequest::historical_orders(user);
+        self.send_info_request(&request).await
+    }
+
     /// Get clearinghouse state (balances, positions, margin) for a user.
     pub async fn info_clearinghouse_state(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::clearinghouse_state(user);
@@ -1494,6 +1500,11 @@ impl HyperliquidHttpClient {
         self.inner.info_frontend_open_orders(user).await
     }
 
+    /// hyperpoo.hl5: Get historical orders (open + filled + canceled).
+    pub async fn info_historical_orders(&self, user: &str) -> Result<Value> {
+        self.inner.info_historical_orders(user).await
+    }
+
     /// Get clearinghouse state (balances, positions, margin) for a user.
     pub async fn info_clearinghouse_state(&self, user: &str) -> Result<Value> {
         self.inner.info_clearinghouse_state(user).await
@@ -2080,41 +2091,205 @@ impl HyperliquidHttpClient {
             }
         };
 
-        let order = match orders
+        if let Some(order) = orders
             .into_iter()
             .find(|o| o.cloid.as_ref().is_some_and(|c| c == &cloid_hex))
         {
-            Some(o) => o,
-            None => return Ok(None),
+            let instrument = match self.get_or_create_instrument(&order.coin, None) {
+                Some(inst) => inst,
+                None => return Ok(None),
+            };
+
+            let status = if order.trigger_activated == Some(true) {
+                HyperliquidOrderStatusEnum::Triggered
+            } else {
+                HyperliquidOrderStatusEnum::Open
+            };
+
+            return match parse_order_status_report_from_basic(
+                &order,
+                &status,
+                &instrument,
+                account_id,
+                ts_init,
+            ) {
+                Ok(mut report) => {
+                    report.client_order_id = Some(*client_order_id);
+                    Ok(Some(report))
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to parse order status report for cloid {cloid_hex}: {e}"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
+        // hyperpoo.hl5: fallback to `historicalOrders` when the cloid isn't
+        // in `frontendOpenOrders`. HL's open-orders set only contains
+        // currently-resting orders; once an order fills (or is canceled), it
+        // disappears from there. Without this fallback NT's inflight retry
+        // sees None repeatedly, times out, and concludes the order was
+        // rejected — which triggers the OUO/OCO cascade to cancel real
+        // protective children for an entry that actually filled. We've seen
+        // this strand POL / DOT / ARB positions naked on hl-dvp.
+        match self.lookup_historical_order_by_cloid(user, &cloid_hex, ts_init).await {
+            Ok(Some(mut report)) => {
+                report.client_order_id = Some(*client_order_id);
+                Ok(Some(report))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                log::warn!(
+                    "hl5: historicalOrders fallback failed for cloid {cloid_hex}: {e}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// hyperpoo.hl5: scan `historicalOrders` for a matching cloid and
+    /// synthesize an OrderStatusReport with the correct terminal status.
+    /// Handles both top-level entries and children (HL emits children as
+    /// their own top-level entries once they're touched).
+    async fn lookup_historical_order_by_cloid(
+        &self,
+        user: &str,
+        cloid_hex: &str,
+        ts_init: nautilus_core::UnixNanos,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        use crate::http::models::HyperliquidHistoricalOrder;
+
+        let account_id = self
+            .account_id
+            .ok_or_else(|| anyhow::anyhow!("Account ID not set"))?;
+
+        let response = self.info_historical_orders(user).await?;
+        let history: Vec<HyperliquidHistoricalOrder> = serde_json::from_value(response)
+            .map_err(|e| anyhow::anyhow!("failed to parse historicalOrders: {e}"))?;
+
+        let Some(entry) = history
+            .into_iter()
+            .find(|e| e.order.cloid.as_ref().is_some_and(|c| c == cloid_hex))
+        else {
+            return Ok(None);
         };
 
-        let instrument = match self.get_or_create_instrument(&order.coin, None) {
+        let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
             Some(inst) => inst,
             None => return Ok(None),
         };
 
-        let status = if order.trigger_activated == Some(true) {
-            HyperliquidOrderStatusEnum::Triggered
-        } else {
-            HyperliquidOrderStatusEnum::Open
+        // Map HL's historical status string to NT's OrderStatus. Children
+        // canceled by HL's automatic OUO/OCO cascade get the dedicated
+        // `siblingFilledCanceled` status — collapse to Canceled because
+        // NT has no equivalent finer state.
+        use nautilus_model::enums::OrderStatus;
+        let order_status = match entry.status.as_str() {
+            "filled" => OrderStatus::Filled,
+            "open" | "triggered" => OrderStatus::Accepted,
+            "canceled" | "siblingFilledCanceled" | "reduceOnlyCanceled"
+                | "rejected" => OrderStatus::Canceled,
+            other => {
+                log::warn!(
+                    "hl5: unknown historicalOrders status '{other}' for cloid {cloid_hex}; \
+                    treating as None"
+                );
+                return Ok(None);
+            }
         };
 
-        match parse_order_status_report_from_basic(
-            &order,
-            &status,
-            &instrument,
+        let order_type_label = entry.order.order_type.as_str();
+        let order_type = match order_type_label {
+            "Limit" => nautilus_model::enums::OrderType::Limit,
+            "Market" => nautilus_model::enums::OrderType::Market,
+            "Stop Market" => nautilus_model::enums::OrderType::StopMarket,
+            "Stop Limit" => nautilus_model::enums::OrderType::StopLimit,
+            "Take Profit Limit" => nautilus_model::enums::OrderType::LimitIfTouched,
+            "Take Profit Market" => nautilus_model::enums::OrderType::MarketIfTouched,
+            _ => nautilus_model::enums::OrderType::Limit,
+        };
+
+        let order_side = nautilus_model::enums::OrderSide::from(entry.order.side);
+        let venue_order_id = nautilus_model::identifiers::VenueOrderId::new(
+            entry.order.oid.to_string(),
+        );
+
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+
+        use rust_decimal::Decimal;
+        let orig_sz: Decimal = entry
+            .order
+            .orig_sz
+            .parse()
+            .map_err(|e| anyhow::anyhow!("hl5: failed to parse orig_sz: {e}"))?;
+        let current_sz: Decimal = entry
+            .order
+            .sz
+            .parse()
+            .unwrap_or(Decimal::ZERO);
+
+        let quantity = nautilus_model::types::Quantity::from_decimal_dp(
+            orig_sz.abs(), size_precision,
+        )
+        .map_err(|e| anyhow::anyhow!("hl5: failed to build quantity: {e}"))?;
+        let filled_qty = nautilus_model::types::Quantity::from_decimal_dp(
+            (orig_sz.abs() - current_sz.abs()).max(Decimal::ZERO),
+            size_precision,
+        )
+        .map_err(|e| anyhow::anyhow!("hl5: failed to build filled_qty: {e}"))?;
+
+        let time_in_force = nautilus_model::enums::TimeInForce::Gtc;
+
+        let ts_accepted = nautilus_core::UnixNanos::from(entry.order.timestamp * 1_000_000);
+        let ts_last = if entry.status_timestamp > 0 {
+            nautilus_core::UnixNanos::from(entry.status_timestamp * 1_000_000)
+        } else {
+            ts_accepted
+        };
+
+        let mut report = OrderStatusReport::new(
             account_id,
+            instrument.id(),
+            None,
+            venue_order_id,
+            order_side,
+            order_type,
+            time_in_force,
+            order_status,
+            quantity,
+            filled_qty,
+            ts_accepted,
+            ts_last,
             ts_init,
-        ) {
-            Ok(mut report) => {
-                report.client_order_id = Some(*client_order_id);
-                Ok(Some(report))
-            }
-            Err(e) => {
-                log::error!("Failed to parse order status report for cloid {cloid_hex}: {e}");
-                Ok(None)
-            }
+            Some(nautilus_core::UUID4::new()),
+        );
+
+        // Limit / trigger prices
+        if let Ok(limit_px_decimal) = entry.order.limit_px.parse::<Decimal>()
+            && limit_px_decimal > Decimal::ZERO
+            && let Ok(price) = nautilus_model::types::Price::from_decimal_dp(
+                limit_px_decimal, price_precision,
+            )
+        {
+            report = report.with_price(price);
         }
+        if let Some(trigger_px_str) = entry.order.trigger_px.as_deref()
+            && let Ok(trigger_px_decimal) = trigger_px_str.parse::<Decimal>()
+            && trigger_px_decimal > Decimal::ZERO
+            && let Ok(trigger_px) = nautilus_model::types::Price::from_decimal_dp(
+                trigger_px_decimal, price_precision,
+            )
+        {
+            report = report.with_trigger_price(trigger_px);
+        }
+        if entry.order.reduce_only {
+            report = report.with_reduce_only(true);
+        }
+
+        Ok(Some(report))
     }
 
     /// Request fill reports for a user.

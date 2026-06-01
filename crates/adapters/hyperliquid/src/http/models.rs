@@ -522,6 +522,46 @@ pub struct HyperliquidOrderStatusEntry {
     pub status_timestamp: u64,
 }
 
+/// hyperpoo.hl5: a single entry in the `historicalOrders` info response.
+/// Each entry wraps an order plus its terminal/current status (`filled`,
+/// `canceled`, `open`, `triggered`, `siblingFilledCanceled`,
+/// `reduceOnlyCanceled`, ...). Used by
+/// `request_order_status_report_by_client_order_id` as a fallback when the
+/// cloid isn't found in `frontendOpenOrders` (typically because the order
+/// already filled and isn't in the active set).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HyperliquidHistoricalOrder {
+    pub order: HyperliquidHistoricalOrderInner,
+    pub status: String,
+    #[serde(rename = "statusTimestamp", default)]
+    pub status_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HyperliquidHistoricalOrderInner {
+    pub coin: Ustr,
+    pub side: HyperliquidSide,
+    #[serde(rename = "limitPx")]
+    pub limit_px: String,
+    pub sz: String,
+    pub oid: u64,
+    pub timestamp: u64,
+    #[serde(rename = "origSz")]
+    pub orig_sz: String,
+    #[serde(default)]
+    pub cloid: Option<String>,
+    #[serde(rename = "orderType", default)]
+    pub order_type: String,
+    #[serde(rename = "triggerPx", default)]
+    pub trigger_px: Option<String>,
+    #[serde(rename = "isTrigger", default)]
+    pub is_trigger: bool,
+    #[serde(rename = "reduceOnly", default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub tif: Option<String>,
+}
+
 /// Represents order information within an order status entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyperliquidOrderInfo {
