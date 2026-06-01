@@ -2134,6 +2134,9 @@ impl HyperliquidHttpClient {
         // rejected — which triggers the OUO/OCO cascade to cancel real
         // protective children for an entry that actually filled. We've seen
         // this strand POL / DOT / ARB positions naked on hl-dvp.
+        eprintln!(
+            "[hl5] frontendOpenOrders missing cloid {cloid_hex}, trying historicalOrders fallback"
+        );
         match self.lookup_historical_order_by_cloid(user, &cloid_hex, ts_init).await {
             Ok(Some(mut report)) => {
                 report.client_order_id = Some(*client_order_id);
@@ -2161,24 +2164,63 @@ impl HyperliquidHttpClient {
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         use crate::http::models::HyperliquidHistoricalOrder;
 
+        // hyperpoo.hl5: eprintln so the path is observable in stderr
+        // regardless of Rust log-crate routing.
+        eprintln!("[hl5] lookup_historical_order_by_cloid: enter cloid={cloid_hex}");
+
         let account_id = self
             .account_id
             .ok_or_else(|| anyhow::anyhow!("Account ID not set"))?;
 
         let response = self.info_historical_orders(user).await?;
+        eprintln!("[hl5] historicalOrders response received, parsing");
         let history: Vec<HyperliquidHistoricalOrder> = serde_json::from_value(response)
-            .map_err(|e| anyhow::anyhow!("failed to parse historicalOrders: {e}"))?;
+            .map_err(|e| {
+                eprintln!("[hl5] PARSE ERROR: {e}");
+                anyhow::anyhow!("failed to parse historicalOrders: {e}")
+            })?;
+        eprintln!("[hl5] parsed {} historicalOrders entries", history.len());
 
-        let Some(entry) = history
-            .into_iter()
-            .find(|e| e.order.cloid.as_ref().is_some_and(|c| c == cloid_hex))
-        else {
+        // Iterate; prefer terminal (filled/canceled) over open if the same
+        // cloid appears multiple times in historicalOrders (HL emits both
+        // the open snapshot AND the terminal-state entry).
+        let mut terminal_entry = None;
+        let mut open_entry = None;
+        for e in history.into_iter() {
+            if e.order.cloid.as_ref().is_some_and(|c| c == cloid_hex) {
+                match e.status.as_str() {
+                    "filled" | "canceled" | "siblingFilledCanceled"
+                    | "reduceOnlyCanceled" | "rejected" => {
+                        if terminal_entry.is_none() {
+                            terminal_entry = Some(e);
+                        }
+                    }
+                    _ => {
+                        if open_entry.is_none() {
+                            open_entry = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(entry) = terminal_entry.or(open_entry) else {
+            eprintln!("[hl5] cloid {cloid_hex} not found in historicalOrders");
             return Ok(None);
         };
+        eprintln!(
+            "[hl5] match: cloid={cloid_hex} status={} oid={}",
+            entry.status, entry.order.oid
+        );
 
         let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
             Some(inst) => inst,
-            None => return Ok(None),
+            None => {
+                eprintln!(
+                    "[hl5] no instrument for coin {} (cloid {cloid_hex})",
+                    entry.order.coin
+                );
+                return Ok(None);
+            }
         };
 
         // Map HL's historical status string to NT's OrderStatus. Children
