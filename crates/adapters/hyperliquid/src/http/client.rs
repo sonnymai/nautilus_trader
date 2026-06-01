@@ -1083,14 +1083,32 @@ impl HyperliquidHttpClient {
         }
     }
 
-    /// Gets the account address for queries: account_address if configured
-    /// (agent wallet), then vault address, otherwise the user (EOA) address.
+    /// Gets the account address for queries.
+    ///
+    /// hyperpoo.hl5: priority is **vault > account_address override > EOA**.
+    ///
+    /// Rationale: in HL's master/agent/vault model the vault is where trades
+    /// actually live — it owns the positions and emits user events. The
+    /// upstream priority was `account_address > vault > EOA`, which meant
+    /// that a master+vault config (where the launcher passes the master as
+    /// account_address for signing purposes) would route all info queries
+    /// to the master instead of the vault. The master holds funds but no
+    /// active positions, so historicalOrders / clearinghouseState / etc.
+    /// returned the wrong dataset — which broke the hl5 cloid-fallback
+    /// path (cloids weren't in the master's history, only the vault's).
+    ///
+    /// `account_address` is retained as an explicit override for the rare
+    /// case of an agent wallet without a vault — but we don't override the
+    /// vault when one is configured.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Auth`] if the client has no signer configured and
     /// no account_address override is set.
     pub fn get_account_address(&self) -> Result<String> {
+        if self.inner.has_vault_address() {
+            return self.inner.get_account_address();  // returns vault
+        }
         if let Some(addr) = &self.account_address {
             return Ok(addr.clone());
         }
