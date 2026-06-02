@@ -2144,16 +2144,35 @@ impl HyperliquidHttpClient {
             };
         }
 
-        // hyperpoo.hl5: fallback to `historicalOrders` when the cloid isn't
-        // in `frontendOpenOrders`. HL's open-orders set only contains
-        // currently-resting orders; once an order fills (or is canceled), it
-        // disappears from there. Without this fallback NT's inflight retry
-        // sees None repeatedly, times out, and concludes the order was
-        // rejected — which triggers the OUO/OCO cascade to cancel real
+        // hyperpoo.hl5f: when the cloid isn't in frontendOpenOrders, walk
+        // two fallback paths in priority order:
+        //   (1) userFills — real-time index of executed fills; catches
+        //       FILLED entries the instant they fill. Most common cascade
+        //       scenario.
+        //   (2) historicalOrders — lagged (~6 minutes) terminal-status
+        //       log; catches CANCELED / TRIGGERED states that never
+        //       reached fill.
+        //
+        // Without (1), NT's 5×6s inflight retry window expires before HL's
+        // historicalOrders indexer catches up, NT gives up and concludes
+        // the entry was rejected, and the OUO/OCO cascade cancels real
         // protective children for an entry that actually filled. We've seen
         // this strand POL / DOT / ARB positions naked on hl-dvp.
         eprintln!(
-            "[hl5] frontendOpenOrders missing cloid {cloid_hex}, trying historicalOrders fallback"
+            "[hl5] frontendOpenOrders missing cloid {cloid_hex}, trying userFills fallback"
+        );
+        match self.lookup_fill_by_cloid(user, &cloid_hex, ts_init).await {
+            Ok(Some(mut report)) => {
+                report.client_order_id = Some(*client_order_id);
+                return Ok(Some(report));
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!(
+                "hl5: userFills fallback failed for cloid {cloid_hex}: {e}"
+            ),
+        }
+        eprintln!(
+            "[hl5] cloid {cloid_hex} not in userFills, trying historicalOrders fallback"
         );
         match self.lookup_historical_order_by_cloid(user, &cloid_hex, ts_init).await {
             Ok(Some(mut report)) => {
@@ -2168,6 +2187,113 @@ impl HyperliquidHttpClient {
                 Ok(None)
             }
         }
+    }
+
+    /// hyperpoo.hl5f: real-time fill lookup by cloid. userFills returns the
+    /// most recent 2000 fills with cloid included, updated as soon as HL
+    /// observes the fill. Synthesizes an OrderStatusReport with
+    /// OrderStatus::Filled when found.
+    async fn lookup_fill_by_cloid(
+        &self,
+        user: &str,
+        cloid_hex: &str,
+        ts_init: nautilus_core::UnixNanos,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| anyhow::anyhow!("Account ID not set"))?;
+
+        eprintln!("[hl5] lookup_fill_by_cloid: enter cloid={cloid_hex}");
+
+        let fills = self.info_user_fills(user).await?;
+        eprintln!("[hl5] userFills returned {} entries", fills.len());
+
+        // Sum sizes across all fills with this cloid (partial fills aggregate)
+        let mut total_sz: rust_decimal::Decimal = rust_decimal::Decimal::ZERO;
+        let mut matched: Option<&crate::http::models::HyperliquidFill> = None;
+        for fill in fills.iter() {
+            if let Some(c) = fill.cloid.as_deref()
+                && c == cloid_hex
+            {
+                if matched.is_none() {
+                    matched = Some(fill);
+                }
+                if let Ok(sz) = fill.sz.parse::<rust_decimal::Decimal>() {
+                    total_sz += sz.abs();
+                }
+            }
+        }
+        let Some(fill) = matched else {
+            eprintln!("[hl5] cloid {cloid_hex} not found in userFills");
+            return Ok(None);
+        };
+
+        eprintln!(
+            "[hl5] FILL match: cloid={cloid_hex} oid={} px={} total_sz={total_sz}",
+            fill.oid, fill.px
+        );
+
+        let instrument = match self.get_or_create_instrument(&fill.coin, None) {
+            Some(inst) => inst,
+            None => {
+                eprintln!(
+                    "[hl5] no instrument for coin {} (cloid {cloid_hex})",
+                    fill.coin
+                );
+                return Ok(None);
+            }
+        };
+
+        use nautilus_model::enums::{OrderSide, OrderStatus, OrderType, TimeInForce};
+
+        let order_side = OrderSide::from(fill.side);
+        let venue_order_id = nautilus_model::identifiers::VenueOrderId::new(
+            fill.oid.to_string(),
+        );
+
+        let size_precision = instrument.size_precision();
+        let quantity = nautilus_model::types::Quantity::from_decimal_dp(
+            total_sz, size_precision,
+        )
+        .map_err(|e| anyhow::anyhow!("hl5: failed to build quantity: {e}"))?;
+        // Filled qty = total_sz (entry fully filled if this is the matched
+        // entry's fills; for partial fills we just report what's known).
+        let filled_qty = quantity;
+
+        let ts_event = nautilus_core::UnixNanos::from(fill.time * 1_000_000);
+
+        let mut report = OrderStatusReport::new(
+            account_id,
+            instrument.id(),
+            None,
+            venue_order_id,
+            order_side,
+            // Order type is unknown from fill alone. Default Limit; for
+            // cascade-prevention this is enough — NT just needs Filled to
+            // keep the OUO contingency from canceling siblings.
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Filled,
+            quantity,
+            filled_qty,
+            ts_event,
+            ts_event,
+            ts_init,
+            Some(nautilus_core::UUID4::new()),
+        );
+
+        // Average fill price = fill.px (most accurate available from this
+        // payload). Use price precision so the report round-trips cleanly.
+        if let Ok(px_decimal) = fill.px.parse::<rust_decimal::Decimal>()
+            && let Ok(price) = nautilus_model::types::Price::from_decimal_dp(
+                px_decimal, instrument.price_precision(),
+            )
+            && let Ok(updated) = report.clone().with_avg_px(price.as_f64())
+        {
+            report = updated;
+        }
+
+        Ok(Some(report))
     }
 
     /// hyperpoo.hl5: scan `historicalOrders` for a matching cloid and

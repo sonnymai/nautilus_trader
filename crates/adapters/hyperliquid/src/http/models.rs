@@ -486,6 +486,13 @@ pub struct HyperliquidFill {
     /// Token the fee was paid in (e.g. "USDC", "HYPE").
     #[serde(rename = "feeToken")]
     pub fee_token: Ustr,
+    /// hyperpoo.hl5f: Optional client order ID (hex). Present when the
+    /// fill is for an order that was submitted with a cloid. Used by
+    /// `lookup_fill_by_cloid` to match orders that NT submitted with a
+    /// pending-cloid placeholder — userFills is real-time so this is the
+    /// fastest reliable signal that an entry filled.
+    #[serde(default)]
+    pub cloid: Option<String>,
 }
 
 /// Represents order status response from `POST /info` with `type: "orderStatus"`.
