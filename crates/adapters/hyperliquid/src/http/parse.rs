@@ -1624,6 +1624,7 @@ mod tests {
             crossed: true,
             fee: "0.0".to_string(),
             fee_token: Ustr::from("+420"),
+            cloid: None,
         };
 
         let account_id = AccountId::from("HYPERLIQUID-001");

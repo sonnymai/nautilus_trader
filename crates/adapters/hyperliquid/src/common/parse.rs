@@ -869,10 +869,29 @@ pub fn parse_account_balances_and_margins(
 
 /// Merges perp clearinghouse balances with spot balances into a unified set.
 ///
-/// The perp parser already reflects combined USDC (its `withdrawable` may include
-/// spot buckets). To avoid double-counting, this helper appends only non-USDC
-/// spot tokens onto the perp-derived balances. If the perp state has no margin
-/// summary, the full spot balance set is used verbatim.
+/// Under Hyperliquid's unified-collateral model (rolled out 2025), spot USDC
+/// is auto-usable as perp collateral — HL itself pulls from spot.total when
+/// a perp position needs more margin than perp.accountValue can cover. The
+/// `spot.hold` field reports the amount currently held as perp margin and
+/// matches `perp.accountValue` closely; the remaining `spot.total - hold` is
+/// the unused free collateral.
+///
+/// The perp parser (`parse_account_balances_and_margins`) reads from
+/// `perp.cross_margin_summary` which reports ONLY the held portion — so for
+/// a vault where most USDC sits in spot waiting to be pulled, that path
+/// reports a fraction of the actual usable collateral. Strategies whose
+/// sizing math depends on `account_value` (e.g. daily_vp's `pct` mode)
+/// silently flatline because they see a nearly-empty balance.
+///
+/// Fix: for USDC specifically, REPLACE the perp-derived USDC balance with
+/// the unified view computed from spot:
+///   - total = spot.USDC.total                          (the full vault USDC)
+///   - free  = spot.USDC.total - perp.totalMarginUsed   (available for new orders)
+/// Non-USDC spot tokens are still appended as-is.
+///
+/// Bug history: 2026-06-04 — hl-dvp's daily_vp flatlined for 4 days when
+/// $233 USDC sat in spot but only $10.61 was reported to NT, dropping
+/// all position-sizing math to qty=0.
 ///
 /// # Errors
 ///
@@ -882,13 +901,50 @@ pub fn parse_combined_account_balances_and_margins(
     spot_state: &SpotClearinghouseState,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
     let (mut balances, margins) = parse_account_balances_and_margins(perp_state)?;
-
-    let has_perp_summary = perp_state.cross_margin_summary.is_some();
     let spot_balances = parse_spot_account_balances(spot_state)?;
 
+    // Locate spot USDC totals for the unified-collateral combine. We pull
+    // from the raw spot_state (not the parsed balances) because we need
+    // both `total` and `hold` to compute free; the parsed `AccountBalance`
+    // form would already have these merged.
+    let spot_usdc = spot_state
+        .balances
+        .iter()
+        .find(|b| b.coin.as_str() == "USDC");
+    let perp_margin_used = perp_state
+        .cross_margin_summary
+        .as_ref()
+        .map(|s| s.total_margin_used.max(Decimal::ZERO))
+        .unwrap_or(Decimal::ZERO);
+
+    if let Some(s) = spot_usdc {
+        let unified_total = s.total.max(Decimal::ZERO);
+        if unified_total > Decimal::ZERO {
+            // free = total - margin_used (clamped ≥ 0). margin_used reflects
+            // ALL currently-locked perp collateral; the difference is what's
+            // free for new orders.
+            let unified_free = (unified_total - perp_margin_used).max(Decimal::ZERO);
+            // Replace or insert the USDC entry.
+            let usdc_balance = AccountBalance::from_total_and_free(
+                unified_total,
+                unified_free,
+                Currency::USDC(),
+            )?;
+            if let Some(slot) = balances
+                .iter_mut()
+                .find(|b| b.currency.code.as_str() == "USDC")
+            {
+                *slot = usdc_balance;
+            } else {
+                balances.push(usdc_balance);
+            }
+        }
+    }
+
+    // Non-USDC spot tokens get appended as-is. USDC was handled above
+    // (replaced or inserted), so skip it here to avoid duplicates.
     for balance in spot_balances {
-        let is_usdc = balance.currency.code.as_str() == "USDC";
-        if has_perp_summary && is_usdc {
+        if balance.currency.code.as_str() == "USDC" {
             continue;
         }
         balances.push(balance);
@@ -1961,7 +2017,11 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_combined_deduplicates_usdc_when_perp_summary_present() {
+    fn test_parse_combined_uses_unified_usdc_when_spot_has_extra() {
+        // Repro of the 2026-06-04 hl-dvp incident: perp accountValue is small
+        // ($500) but spot has additional USDC ($123 here, $232 in production).
+        // Under HL's unified-collateral model the spot USDC is auto-usable for
+        // perp margin, so NT should see the combined $623 — not just $500.
         let perp_json = r#"{
             "assetPositions": [],
             "crossMarginSummary": {
@@ -1977,7 +2037,7 @@ mod tests {
 
         let spot_json = r#"{
             "balances": [
-                {"coin": "USDC", "token": 0, "total": "123", "hold": "0", "entryNtl": "0"},
+                {"coin": "USDC", "token": 0, "total": "623", "hold": "500", "entryNtl": "0"},
                 {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
             ]
         }"#;
@@ -1988,10 +2048,49 @@ mod tests {
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
-        assert_eq!(balances[0].currency.code.as_str(), "USDC");
-        assert_eq!(balances[0].total.as_decimal(), dec!(500));
+        let usdc = &balances[0];
+        assert_eq!(usdc.currency.code.as_str(), "USDC");
+        // Total = spot.total (the full vault USDC, including the held portion
+        // that's already counted in perp.accountValue).
+        assert_eq!(usdc.total.as_decimal(), dec!(623));
+        // Free = total - margin_used (clamped >=0). With margin_used=0, all
+        // 623 is available for new orders.
+        assert_eq!(usdc.free.as_decimal(), dec!(623));
+        // Non-USDC tokens still appended.
         assert_eq!(balances[1].currency.code.as_str(), "PURR");
         assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_subtracts_perp_margin_used_from_free() {
+        // Repro of the hl-vf shape: spot.USDC.total = $3000, spot.hold = $200
+        // (matches perp's totalMarginUsed). The combined USDC total stays at
+        // $3000; combined free = $3000 - $200 = $2800.
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "200",
+                "totalNtlPos": "1000",
+                "totalRawUsd": "200",
+                "totalMarginUsed": "200",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "3000", "hold": "200", "entryNtl": "0"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, _) =
+            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].total.as_decimal(), dec!(3000));
+        assert_eq!(balances[0].free.as_decimal(), dec!(2800));
     }
 
     #[rstest]
