@@ -2469,7 +2469,15 @@ impl HyperliquidHttpClient {
                 trigger_px_decimal, price_precision,
             )
         {
-            report = report.with_trigger_price(trigger_px);
+            // Must set BOTH trigger_price AND trigger_type — Python's
+            // OrderStatusReport.__init__ asserts trigger_type != NO_TRIGGER
+            // whenever trigger_price > 0. Without this the from_pyo3
+            // conversion fires ValueError on reconciliation. (2026-06-08)
+            report = report
+                .with_trigger_price(trigger_px)
+                .with_trigger_type(
+                    nautilus_model::enums::TriggerType::Default,
+                );
         }
         if entry.order.reduce_only {
             report = report.with_reduce_only(true);

@@ -27,7 +27,7 @@ use nautilus_model::{
     },
     enums::{
         AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType, RecordFlag,
-        TimeInForce,
+        TimeInForce, TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
@@ -347,7 +347,13 @@ pub fn parse_ws_order_status_report(
 
     if let Some(ref trigger_px_str) = order.order.trigger_px {
         let trigger_price = parse_price(trigger_px_str, instrument, "order.triggerPx")?;
-        report = report.with_trigger_price(trigger_price);
+        // Must set BOTH trigger_price AND trigger_type — Python's
+        // OrderStatusReport.__init__ asserts trigger_type != NO_TRIGGER
+        // whenever trigger_price > 0. Without this the from_pyo3
+        // conversion fires ValueError on reconciliation. (2026-06-08)
+        report = report
+            .with_trigger_price(trigger_price)
+            .with_trigger_type(TriggerType::Default);
     }
 
     Ok(report)
